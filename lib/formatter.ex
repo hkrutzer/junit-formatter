@@ -39,7 +39,8 @@ defmodule JUnitFormatter do
               skipped: 0,
               tests: 0,
               time: 0,
-              test_cases: []
+              test_cases: %{},
+              timestamp: nil
 
     @type t :: %__MODULE__{
             errors: non_neg_integer,
@@ -47,8 +48,21 @@ defmodule JUnitFormatter do
             skipped: non_neg_integer,
             tests: non_neg_integer,
             time: non_neg_integer,
-            test_cases: [ExUnit.Test.t()]
+            test_cases: %{optional(String.t()) => ExUnit.Test.t()}
           }
+  end
+
+  defmodule Test do
+    defstruct [
+      :name,
+      :case,
+      :module,
+      :state,
+      :time,
+      :tags,
+      :logs,
+      :started_at
+    ]
   end
 
   defstruct cases: %{}, properties: %{}
@@ -69,6 +83,40 @@ defmodule JUnitFormatter do
   end
 
   @impl true
+  def handle_cast({:case_started, c}, state) do
+    tests =
+      Enum.map(c.tests, fn t ->
+        t = struct(Test, Map.from_struct(t))
+        {t.name, t}
+      end)
+      |> Map.new()
+
+    cases =
+      Map.put(state.cases, c.name, %Stats{
+        test_cases: tests,
+        timestamp: DateTime.utc_now(:second)
+      })
+
+    {:noreply, %{state | cases: cases}}
+  end
+
+  def handle_cast({:test_started, %ExUnit.Test{} = test}, state) do
+    state =
+      put_in(
+        state,
+        [
+          Access.key!(:cases),
+          Access.key!(test.case),
+          Access.key!(:test_cases),
+          Access.key!(test.name),
+          Access.key!(:started_at)
+        ],
+        DateTime.utc_now(:second)
+      )
+
+    {:noreply, state}
+  end
+
   def handle_cast({:suite_finished, %{async: _, load: _, run: _}}, config) do
     handle_suite_finished(config)
 
@@ -168,19 +216,41 @@ defmodule JUnitFormatter do
     end
   end
 
-  defp adjust_case_stats(%ExUnit.Test{case: name, time: time} = test, type, state) do
-    test_without_logs = %ExUnit.Test{test | logs: ""}
+  defp adjust_case_stats(%ExUnit.Test{case: case_name, time: time} = test, type, state) do
+    state =
+      put_in(
+        state,
+        [
+          Access.key!(:cases),
+          Access.key!(case_name),
+          Access.key!(:test_cases),
+          Access.key!(test.name),
+          Access.key!(:time)
+        ],
+        time
+      )
+
+    state =
+      put_in(
+        state,
+        [
+          Access.key!(:cases),
+          Access.key!(case_name),
+          Access.key!(:test_cases),
+          Access.key!(test.name),
+          Access.key!(:state)
+        ],
+        test.state
+      )
 
     cases =
-      Map.update(
-        state.cases,
-        name,
-        struct(Stats, [{type, 1}, test_cases: [test_without_logs], time: time, tests: 1]),
+      state.cases
+      |> Map.update!(
+        case_name,
         fn stats ->
           stats =
             struct(
               stats,
-              test_cases: [test_without_logs | stats.test_cases],
               time: stats.time + time,
               tests: stats.tests + 1
             )
@@ -199,7 +269,7 @@ defmodule JUnitFormatter do
       end
 
     cases =
-      for {test, idx} <- Enum.with_index(stats.test_cases, 1) do
+      for {test, idx} <- Enum.with_index(Map.values(stats.test_cases), 1) do
         generate_testcases(test, idx)
       end
 
@@ -211,6 +281,7 @@ defmodule JUnitFormatter do
         skipped: stats.skipped,
         name: name,
         tests: stats.tests,
+        timestamp: DateTime.to_iso8601(stats.timestamp),
         time: format_time(stats.time)
       ],
       [{:properties, [], properties} | cases]
@@ -221,6 +292,7 @@ defmodule JUnitFormatter do
     attrs = [
       classname: Atom.to_string(test.case),
       name: Atom.to_string(test.name),
+      timestamp: DateTime.to_iso8601(test.started_at || DateTime.utc_now(:second)),
       time: format_time(test.time)
     ]
 
@@ -233,23 +305,25 @@ defmodule JUnitFormatter do
     }
   end
 
-  defp generate_test_body(%ExUnit.Test{state: nil}, _idx), do: []
+  defp generate_test_body(%Test{state: nil}, _idx), do: []
 
-  defp generate_test_body(%ExUnit.Test{state: {atom, message}}, _idx)
+  defp generate_test_body(%Test{state: {atom, message}}, _idx)
        when atom in ~w[skip skipped excluded]a do
     [{:skipped, [message: message], []}]
   end
 
-  defp generate_test_body(%ExUnit.Test{state: {:failed, failures}} = test, idx) do
+  defp generate_test_body(%Test{state: {:failed, failures}} = test, idx) do
     body =
       test
+      |> Map.from_struct()
+      |> then(&struct(ExUnit.Test, &1))
       |> ExUnit.Formatter.format_test_failure(failures, idx, :infinity, fn _, msg -> msg end)
       |> :erlang.binary_to_list()
 
     [{:failure, [message: message(failures)], [body]}]
   end
 
-  defp generate_test_body(%ExUnit.Test{state: {:invalid, %name{} = module}}, _idx),
+  defp generate_test_body(%Test{state: {:invalid, %name{} = module}}, _idx),
     do: [{:error, [message: "Invalid module #{name}"], [~c"#{inspect(module)}"]}]
 
   defp message([msg | _]), do: message(msg)
